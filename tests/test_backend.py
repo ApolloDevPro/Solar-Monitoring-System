@@ -31,9 +31,7 @@ def fresh_db(tmp_path):
 def client(fresh_db, monkeypatch):
     """TestClient with the global db swapped for a fresh one."""
     monkeypatch.setattr(app_module, "db", fresh_db)
-    monkeypatch.setattr(app_module, "SOLAR_API_KEY", "test-secret")
     with TestClient(app_module.app, raise_server_exceptions=True) as c:
-        c.headers.update({"X-API-Key": "test-secret"})
         yield c
 
 
@@ -229,29 +227,6 @@ def test_fault_history_endpoint(client):
     assert r.json()["items"][0]["tracking_state"] == "SENSOR_FAULT"
 
 
-# ── API key auth ──────────────────────────────────────────────────────────────
-def test_api_key_required_when_set(fresh_db, monkeypatch):
-    monkeypatch.setattr(app_module, "db", fresh_db)
-    monkeypatch.setattr(app_module, "SOLAR_API_KEY", "secret123")
-    with TestClient(app_module.app) as c:
-        # Without key — should be 401
-        post_telemetry_no_key = c.post("/api/telemetry", json=BASE_TELEMETRY)
-        assert post_telemetry_no_key.status_code == 401
-        assert c.get("/api/state").status_code == 401
-        # With correct key — should work
-        r = c.post("/api/telemetry", json=BASE_TELEMETRY,
-                   headers={"X-API-Key": "secret123"})
-        assert r.status_code == 200
-
-
-def test_protected_routes_fail_closed_without_configured_key(fresh_db, monkeypatch):
-    monkeypatch.setattr(app_module, "db", fresh_db)
-    monkeypatch.setattr(app_module, "SOLAR_API_KEY", "")
-    with TestClient(app_module.app) as c:
-        response = c.post("/api/telemetry", json=BASE_TELEMETRY)
-    assert response.status_code == 503
-
-
 def test_validate_command_rejects_unknown_type(client):
     command = app_module.CommandCreate(type="unknown")
     assert "unknown command type" in app_module.validate_command(command)[0]
@@ -274,20 +249,12 @@ def test_sse_reconnect_continues_event_id():
             {"type": "http", "method": "GET", "path": "/api/events", "headers": []},
             receive,
         )
-        response = await app_module.stream_events(request, "41", None)
+        response = await app_module.stream_events(request, "41")
         chunk = await anext(response.body_iterator)
         await response.body_iterator.aclose()
         return chunk
 
     assert asyncio.run(first_event()).startswith("id: 42\n")
-
-
-def test_example_placeholder_key_is_rejected(client, monkeypatch):
-    monkeypatch.setattr(
-        app_module, "SOLAR_API_KEY", "replace-this-with-a-long-random-secret"
-    )
-    response = client.get("/api/state")
-    assert response.status_code == 503
 
 
 # ── delete endpoints ──────────────────────────────────────────────────────────
@@ -330,6 +297,23 @@ def test_z_telemetry_rate_limit(client):
             for tick in range(310)
         ]
         assert 429 in statuses
+    finally:
+        app_module.limiter.enabled = False
+
+
+def test_z2_pending_allows_hardware_poll_rate(client):
+    # The serial bridge polls /api/commands/pending every 0.25s = 240 req/min.
+    # The global 200/min default would throttle it after ~50s of runtime, so
+    # this route carries its own 600/minute override.  Regression guard.
+    app_module.limiter.enabled = True
+    try:
+        statuses = [
+            client.get(
+                f"/api/commands/pending?device_id=solar-tracker-01&after_id={i}"
+            ).status_code
+            for i in range(250)
+        ]
+        assert 429 not in statuses
     finally:
         app_module.limiter.enabled = False
 
@@ -422,23 +406,6 @@ def test_command_result_on_expired_command_is_refused(client):
     assert late.status_code == 409
     row = client.get(f"/api/commands/{cmd_id}").json()["command"]
     assert row["status"] == "EXPIRED"
-
-
-def test_non_ascii_api_key_does_not_500():
-    # hmac.compare_digest on plain str used to raise TypeError for non-ASCII
-    # input, turning key mismatches into 500s.  With .encode() both sides are
-    # bytes, so a non-ASCII *stored* key still yields a clean 401 and a
-    # matching non-ASCII pair still authenticates.  (HTTP headers themselves
-    # are ASCII-only, so this exercises require_api_key directly.)
-    from fastapi import HTTPException
-
-    with pytest.MonkeyPatch.context() as mp:
-        mp.setattr(app_module, "SOLAR_API_KEY", "sécret-key-✓")
-        with pytest.raises(HTTPException) as exc:
-            app_module.require_api_key("wrong-key")
-        assert exc.value.status_code == 401
-        # Matching non-ASCII pair must authenticate (no TypeError/500).
-        assert app_module.require_api_key("sécret-key-✓") is None
 
 
 def test_state_unknown_device_echoes_requested_id(client):

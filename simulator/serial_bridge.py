@@ -20,8 +20,11 @@ Usage
 from __future__ import annotations
 
 import argparse
+import logging
+import os
 import time
 from collections import deque
+from logging.handlers import RotatingFileHandler
 from typing import Any, Deque, Dict, List, Optional
 
 from dotenv import load_dotenv
@@ -36,6 +39,32 @@ except ImportError:  # pragma: no cover
     raise SystemExit(1)
 
 from simulator.http_client import Backend  # noqa: E402  (single HTTP client)
+
+log = logging.getLogger("solar.bridge")
+
+
+def configure_logging(level: str = "INFO", log_file: Optional[str] = None) -> None:
+    """Console + optional rotating-file logging for the bridge.
+
+    A field deployment runs unattended, so stdout alone is not enough: this
+    writes ``logs/serial_bridge.log`` (1 MB x 3 backups) in addition to the
+    console.  Safe to call more than once (handlers are not duplicated).
+    """
+    root = logging.getLogger("solar")
+    root.setLevel(level.upper())
+    if root.handlers:
+        return
+    fmt = logging.Formatter("%(asctime)s %(levelname)-7s %(name)s: %(message)s")
+    console = logging.StreamHandler()
+    console.setFormatter(fmt)
+    root.addHandler(console)
+    if log_file:
+        os.makedirs(os.path.dirname(log_file) or ".", exist_ok=True)
+        file_handler = RotatingFileHandler(
+            log_file, maxBytes=1_000_000, backupCount=3, encoding="utf-8"
+        )
+        file_handler.setFormatter(fmt)
+        root.addHandler(file_handler)
 
 
 # ---------------------------------------------------------- serial ports ---
@@ -53,9 +82,9 @@ def pick_port(explicit: Optional[str]) -> str:
     for p in ports:
         desc = (p.description or "").lower()
         if any(k in desc for k in ("arduino", "ch340", "cp210", "usb serial", "wch")):
-            print(f"[bridge] auto-selected {p.device} ({p.description})")
+            log.info("auto-selected %s (%s)", p.device, p.description)
             return p.device
-    print(f"[bridge] auto-selected {ports[0].device} ({ports[0].description})")
+    log.info("auto-selected %s (%s)", ports[0].device, ports[0].description)
     return ports[0].device
 
 
@@ -122,22 +151,65 @@ def _answer_pending(backend: Backend, status: str, reason: str) -> None:
     now = time.monotonic()
     while _WAITING and _WAITING[0]["deadline"] < now:
         stale = _WAITING.popleft()
-        print(f"[bridge] <- #{stale['cmd_id']} ack timed out")
+        log.warning("<- #%s ack timed out", stale["cmd_id"])
     if not _WAITING:
         return
     entry = _WAITING.popleft()
     backend.post(f"/api/commands/{entry['cmd_id']}/result", {"status": status, "reason": reason})
-    print(f"[bridge] <- #{entry['cmd_id']} {status}: {reason}")
+    log.info("<- #%s %s: %s", entry["cmd_id"], status, reason)
+
+
+# ------------------------------------------------------- telemetry queue ---
+def enqueue_telemetry(
+    queue: Deque[Dict[str, Any]], payload: Dict[str, Any]
+) -> None:
+    """Buffer a sample the backend refused (429 / outage) for a later retry.
+
+    ``queue`` is a ``deque(maxlen=...)`` so memory is bounded; the oldest
+    sample is dropped first (live data beats stale data on a solar tracker).
+    """
+    queue.append(payload)
+    log.warning("telemetry post failed - queued (depth=%d)", len(queue))
+
+
+def flush_telemetry(
+    backend: Backend,
+    queue: Deque[Dict[str, Any]],
+    now: float,
+    last_flush: float,
+    min_interval_s: float,
+) -> float:
+    """Retry at most ONE queued sample per ``min_interval_s`` window.
+
+    Fresh reports already run at 240/min against a 300/min backend limit, so
+    only ~60/min of retry headroom exists - flushing faster than ~1 sample
+    per 1.5s would trade live samples for stale ones.  Returns the new
+    ``last_flush`` timestamp (unchanged when nothing was sent or the backend
+    is still down; the queue keeps its order either way).
+    """
+    if not queue or (now - last_flush) < min_interval_s:
+        return last_flush
+    if backend.post("/api/telemetry", queue[0]):
+        queue.popleft()
+        if queue:
+            log.info("flushed 1 queued sample (depth=%d)", len(queue))
+        else:
+            log.info("flushed last queued sample - queue empty")
+        return now
+    log.debug("flush skipped - backend still unreachable")
+    return last_flush
 
 
 # ---------------------------------------------------------------- main -----
 def run(args: argparse.Namespace) -> int:
+    configure_logging(args.log_level, args.log_file)
+
     if args.list:
         ports = list_serial()
         if not ports:
-            print("no serial ports found")
+            log.info("no serial ports found")
         for p in ports:
-            print(f"  {p.device:8s} {p.description}")
+            log.info("  %s  %s", f"{p.device:8s}", p.description)
         return 0
 
     backend = Backend(f"http://{args.host}:{args.port}")
@@ -148,7 +220,7 @@ def run(args: argparse.Namespace) -> int:
             break
         time.sleep(0.25)
     else:
-        print(f"[bridge] backend not reachable at {backend.base_url} - start it first")
+        log.error("backend not reachable at %s - start it first", backend.base_url)
         return 1
 
     port = pick_port(args.port_name)
@@ -156,19 +228,24 @@ def run(args: argparse.Namespace) -> int:
     seq = 0
     pending_after = 0
     last_health = 0.0
+    last_flush = 0.0
     tx_buf = ""
     reconnect_delay = 1.0
+    # Samples the backend refused (outage / rate limit) - retried later at
+    # a paced rate so retries never starve fresh telemetry.
+    retry_queue: Deque[Dict[str, Any]] = deque(maxlen=args.queue_size)
 
     while True:  # reconnect loop: a USB blip must not kill the bridge
         try:
             ser = serial.Serial(port, 115200, timeout=2)
         except serial.SerialException as exc:
-            print(f"[bridge] cannot open {port}: {exc}")
-            print("[bridge] close the Arduino Serial Monitor first, then retry")
+            log.error("cannot open %s: %s", port, exc)
+            log.error("close the Arduino Serial Monitor first, then retry")
             return 1
 
-        print(f"[bridge] serial {port} @115200 <-> {backend.base_url}")
-        print(f"[bridge] device_id={device_id}")
+        log.info("serial %s @115200 <-> %s", port, backend.base_url)
+        log.info("device_id=%s queue<=%d flush every %.1fs",
+                 device_id, args.queue_size, args.flush_interval)
         time.sleep(2.0)          # auto-reset after opening the port
         ser.reset_input_buffer()
         reconnect_delay = 1.0
@@ -195,11 +272,16 @@ def run(args: argparse.Namespace) -> int:
                             seq += 1
                             payload["seq"] = seq
                             if not backend.post("/api/telemetry", payload):
-                                print("[bridge] telemetry post failed")
+                                enqueue_telemetry(retry_queue, payload)
                     elif line.startswith("OK"):
                         _answer_pending(backend, "EXECUTED", line[2:].strip() or "accepted")
                     elif line.startswith("ERR"):
                         _answer_pending(backend, "REJECTED", line[3:].strip() or "rejected")
+
+                # ---- retry previously dropped samples (paced) --------------
+                last_flush = flush_telemetry(
+                    backend, retry_queue, now, last_flush, args.flush_interval
+                )
 
                 # ---- backend -> serial (pending commands) -----------------
                 data = backend.get(
@@ -216,7 +298,7 @@ def run(args: argparse.Namespace) -> int:
                             {"status": "REJECTED", "reason": "unsupported command type"},
                         )
                         continue
-                    print(f"[bridge] -> #{cmd['id']} {serial_line}")
+                    log.info("-> #%s %s", cmd["id"], serial_line)
                     try:
                         ser.write((serial_line + "\n").encode())
                         ser.flush()
@@ -232,15 +314,16 @@ def run(args: argparse.Namespace) -> int:
                     last_health = now
                     state = backend.get(f"/api/state?device_id={device_id}")
                     if state and not state.get("is_online"):
-                        print("[bridge] waiting for telemetry from the board...")
+                        log.info("waiting for telemetry from the board...")
 
                 time.sleep(args.poll)
         except _SerialLost as exc:
-            print(f"[bridge] serial lost: {exc.reason} - reconnecting in {reconnect_delay:.0f}s")
+            log.warning("serial lost: %s - reconnecting in %.0fs",
+                        exc.reason, reconnect_delay)
             _WAITING.clear()
             tx_buf = ""
         except KeyboardInterrupt:
-            print("\n[bridge] stopped")
+            log.info("stopped")
             return 0
         finally:
             try:
@@ -268,7 +351,19 @@ def main() -> int:
     p.add_argument("--device-id", default="solar-tracker-01")
     p.add_argument("--poll", type=float, default=0.25)
     p.add_argument("--list", action="store_true", help="list serial ports")
-    return run(p.parse_args())
+    p.add_argument("--log-file", default="logs/serial_bridge.log",
+                   help="rotating log path (1 MB x 3); use '' to disable")
+    p.add_argument("--log-level", default="INFO",
+                   choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    p.add_argument("--queue-size", type=int, default=200,
+                   help="ring buffer for telemetry the backend refused")
+    p.add_argument("--flush-interval", type=float, default=1.5,
+                   help="seconds between retries of queued telemetry "
+                        "(keeps retries under the backend rate limit)")
+    args = p.parse_args()
+    if args.log_file == "":
+        args.log_file = None
+    return run(args)
 
 
 if __name__ == "__main__":

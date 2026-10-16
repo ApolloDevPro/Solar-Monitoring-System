@@ -87,12 +87,6 @@
             <span class="photo-badge" id="svgState">Waiting for telemetry</span>
           </div>
         </figure>
-        <p class="image-credit">
-          Reference photo by <a href="https://commons.wikimedia.org/wiki/File:Ground_mounted_solar_panels.gk.jpg"
-             target="_blank" rel="noopener noreferrer">Grendelkhan</a> ·
-          <a href="https://creativecommons.org/licenses/by-sa/4.0/" target="_blank"
-             rel="noopener noreferrer">CC BY-SA 4.0</a>
-        </p>
         <div class="legend">
           <span><i class="dot dot-left"></i> Left LDR</span>
           <span><i class="dot dot-right"></i> Right LDR</span>
@@ -102,18 +96,6 @@
 
       <section class="card" id="control">
         <h2>Remote control <small>Commands are validated, stored and answered with a reason</small></h2>
-
-        <div class="control-block">
-          <label class="control-label" for="apiKeyInput">API access key</label>
-          <div class="row">
-            <input id="apiKeyInput" type="password" autocomplete="current-password"
-                   placeholder="Enter SOLAR_API_KEY" />
-            <button class="btn btn-ghost" id="btnToggleKey" type="button"
-                    aria-label="Show API key" aria-pressed="false">Show</button>
-            <button class="btn btn-ghost" id="btnSaveKey" type="button">Connect</button>
-          </div>
-          <p class="hint" id="keyHint" aria-live="polite">Enter the shared API key from your .env file. It is kept for this browser session only.</p>
-        </div>
 
         <div class="control-block">
           <label class="control-label">Control mode</label>

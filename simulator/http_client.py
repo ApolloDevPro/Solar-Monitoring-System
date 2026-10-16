@@ -2,31 +2,20 @@
 from __future__ import annotations
 
 import json
-import os
 import urllib.error
 import urllib.request
 from typing import Any, Dict, Optional
-
-from dotenv import load_dotenv
-
-load_dotenv()
 
 
 class Backend:
     """Minimal stdlib HTTP client — no third-party dependencies."""
 
-    def __init__(self, base_url: str, timeout: float = 4.0, api_key: str = "") -> None:
+    def __init__(self, base_url: str, timeout: float = 4.0) -> None:
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
-        self._api_key = api_key or os.getenv("SOLAR_API_KEY", "")
 
     def _headers(self, extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
-        h: Dict[str, str] = {}
-        if extra:
-            h.update(extra)
-        if self._api_key:
-            h["X-API-Key"] = self._api_key
-        return h
+        return dict(extra) if extra else {}
 
     def post(self, path: str, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         headers = self._headers({"Content-Type": "application/json"})

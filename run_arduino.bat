@@ -14,7 +14,7 @@ echo.
 
 python ensure_env.py
 if errorlevel 1 (
-  echo ERROR: Could not configure the local API key.
+  echo ERROR: Could not create the local .env file.
   pause
   exit /b 1
 )

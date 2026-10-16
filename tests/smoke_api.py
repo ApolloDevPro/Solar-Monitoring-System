@@ -12,9 +12,7 @@ from backend.database import Database
 def smoke_client(tmp_path, monkeypatch):
     database = Database(tmp_path / "smoke.db")
     monkeypatch.setattr(app_module, "db", database)
-    monkeypatch.setattr(app_module, "SOLAR_API_KEY", "smoke-test-secret")
     with TestClient(app_module.app) as client:
-        client.headers.update({"X-API-Key": "smoke-test-secret"})
         yield client
     database.close()
 

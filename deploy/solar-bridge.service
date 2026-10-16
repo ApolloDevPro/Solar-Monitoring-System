@@ -1,0 +1,18 @@
+[Unit]
+Description=Solar Tracker Monitoring System - Arduino serial bridge
+After=solar-backend.service
+Wants=solar-backend.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/solar-monitoring-system
+ExecStart=/usr/bin/python3 -m simulator.serial_bridge --log-file logs/serial_bridge.log
+Restart=always
+RestartSec=2
+Environment=PYTHONUNBUFFERED=1
+# Serial access needs the dialout group on most distros; run as a user in it.
+User=solar
+Group=dialout
+
+[Install]
+WantedBy=multi-user.target

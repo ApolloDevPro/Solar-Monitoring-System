@@ -33,10 +33,6 @@ const el = {
   btnMove: $("btnMove"),
   btnPark: $("btnPark"),
   btnResync: $("btnResync"),
-  apiKeyInput: $("apiKeyInput"),
-  btnSaveKey: $("btnSaveKey"),
-  btnToggleKey: $("btnToggleKey"),
-  keyHint: $("keyHint"),
   btnNotifications: $("btnNotifications"),
   moveHint: $("moveHint"),
   stSamples: $("stSamples"),
@@ -61,7 +57,6 @@ const el = {
 let cfg = null;
 let lastState = null;
 let toastTimer = null;
-let apiKey = sessionStorage.getItem("solarApiKey") || "";
 let lastEventId = sessionStorage.getItem("solarLastEventId") || "";
 let liveAbort = null;
 let liveRunning = false;
@@ -123,7 +118,6 @@ function setPill(node, text, kind) {
 
 async function getJSON(path, opts = {}) {
   const headers = new Headers(opts.headers || {});
-  if (apiKey) headers.set("X-API-Key", apiKey);
   const res = await fetch(API + path, { ...opts, headers });
   const body = await res.json().catch(() => ({}));
   if (!res.ok) {
@@ -310,9 +304,13 @@ const CHART_PAD_R = 10;
 function drawChart(canvas, seriesList, opts = {}) {
   const dpr = window.devicePixelRatio || 1;
   const cssW = canvas.clientWidth || 600;
-  const cssH = parseInt(canvas.getAttribute("height"), 10) || 230;
-  canvas.width = cssW * dpr;
-  canvas.height = cssH * dpr;
+  // clientHeight comes from the stylesheet (style.css pins canvas height),
+  // NOT from the height attribute: assigning canvas.height below overwrites
+  // that attribute, so re-reading it would compound dpr every repaint and
+  // make the chart grow without bound on scaled displays.
+  const cssH = canvas.clientHeight || 230;
+  canvas.width = Math.round(cssW * dpr);
+  canvas.height = Math.round(cssH * dpr);
   const ctx = canvas.getContext("2d");
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
@@ -793,8 +791,15 @@ function downloadBlob(filename, content, type) {
   const blob = new Blob([content], { type });
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
-  a.href = url; a.download = filename; a.click();
-  setTimeout(() => URL.revokeObjectURL(url), 1000);
+  a.href = url;
+  a.download = filename;
+  a.style.display = "none";
+  // The anchor must be in the document or Safari/iOS silently ignore .click()
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  // Revoke late: revoking while a slow download is still starting cancels it.
+  setTimeout(() => URL.revokeObjectURL(url), 60000);
 }
 
 function toCSV(items, keys) {
@@ -813,6 +818,7 @@ $("btnExportLightCSV").addEventListener("click", async () => {
     const data = await getJSON("/api/history/light?limit=5000");
     downloadBlob("light_history.csv",
       toCSV(data.items, ["id","ts","ldr_left","ldr_right","difference"]), "text/csv");
+    toast("Exported light_history.csv");
   } catch (err) {
     toast("Export failed: " + err.message, "err");
   }
@@ -823,33 +829,41 @@ $("btnExportOrientCSV").addEventListener("click", async () => {
     const data = await getJSON("/api/history/orientation?limit=2000");
     downloadBlob("orientation_history.csv",
       toCSV(data.items, ["id","ts","angle","mode","tracking_state","reason"]), "text/csv");
+    toast("Exported orientation_history.csv");
   } catch (err) {
     toast("Export failed: " + err.message, "err");
   }
 });
 
 $("btnExportJSON").addEventListener("click", async () => {
-  try {
-    const [light, orient, faults, cmds, state, summary] = await Promise.all([
-      getJSON("/api/history/light?limit=5000"),
-      getJSON("/api/history/orientation?limit=2000"),
-      getJSON("/api/history/faults?limit=1000"),
-      getJSON("/api/history/commands?limit=1000"),
-      getJSON("/api/state"),
-      getJSON("/api/summary"),
-    ]);
-    const json = JSON.stringify({
-      state,
-      summary,
-      light: light.items,
-      orientation: orient.items,
-      faults: faults.items,
-      commands: cmds.items,
-    }, null, 2);
-    downloadBlob("solar_tracker_export.json", json, "application/json");
-  } catch (err) {
-    toast("Export failed: " + err.message, "err");
+  // allSettled: one throttled/failed source must not lose the whole export.
+  const results = await Promise.allSettled([
+    getJSON("/api/history/light?limit=5000"),
+    getJSON("/api/history/orientation?limit=2000"),
+    getJSON("/api/history/faults?limit=1000"),
+    getJSON("/api/history/commands?limit=1000"),
+    getJSON("/api/state"),
+    getJSON("/api/summary"),
+  ]);
+  const ok = results.map(r => (r.status === "fulfilled" ? r.value : null));
+  const failed = results.filter(r => r.status === "rejected");
+  if (failed.length === results.length) {
+    toast("Export failed: " + (failed[0].reason && failed[0].reason.message || "unknown error"), "err");
+    return;
   }
+  const [light, orient, faults, cmds, state, summary] = ok;
+  const json = JSON.stringify({
+    state,
+    summary,
+    light: light ? light.items : [],
+    orientation: orient ? orient.items : [],
+    faults: faults ? faults.items : [],
+    commands: cmds ? cmds.items : [],
+  }, null, 2);
+  downloadBlob("solar_tracker_export.json", json, "application/json");
+  toast(failed.length
+    ? "Exported solar_tracker_export.json — " + failed.length + " source(s) unavailable, data may be partial"
+    : "Exported solar_tracker_export.json", failed.length ? "err" : "ok");
 });
 
 /* ------------------------------------------------------------------ */
@@ -874,9 +888,9 @@ function setLive(on) {
 function scheduleFallback() {
   if (fallbackTimer) clearTimeout(fallbackTimer);
   fallbackTimer = setTimeout(async () => {
-    if (!sseLive && apiKey) await refresh(false);
+    if (!sseLive) await refresh(false);
     scheduleFallback();
-  }, sseLive || !apiKey ? 10000 : fallbackDelay);
+  }, sseLive ? 10000 : fallbackDelay);
 }
 
 function heavyRefresh() {
@@ -924,13 +938,10 @@ function handleSseFrame(frame) {
 
 async function connectLive() {
   let retryMs = 500;
-  while (apiKey) {
+  while (true) {
     liveAbort = new AbortController();
     try {
-      const headers = new Headers({
-        Accept: "text/event-stream",
-        "X-API-Key": apiKey,
-      });
+      const headers = new Headers({ Accept: "text/event-stream" });
       if (lastEventId) headers.set("Last-Event-ID", lastEventId);
       const response = await fetch(API + "/api/events", {
         headers,
@@ -959,11 +970,11 @@ async function connectLive() {
       }
     } catch (err) {
       if (err.name !== "AbortError") {
-        el.keyHint.textContent = "Live connection interrupted: " + err.message;
+        // Non-fatal: the retry loop below reconnects; the pill shows offline.
+        console.warn("SSE interrupted:", err.message);
       }
     }
     setLive(false);
-    if (!apiKey) break;
     await new Promise(resolve => setTimeout(resolve, retryMs));
     retryMs = Math.min(retryMs * 2, 10000);
   }
@@ -971,7 +982,7 @@ async function connectLive() {
 }
 
 function startLive() {
-  if (!apiKey || liveRunning) return;
+  if (liveRunning) return;
   liveRunning = true;
   connectLive();
 }
@@ -992,16 +1003,13 @@ async function refresh(force) {
       setPill(el.pillConn, "rate limited - backing off", "warn");
       return false;
     }
-    const authFailure = /api key|authentication|X-API-Key/i.test(err.message);
-    setPill(el.pillConn, authFailure ? "API key required" : "backend unreachable", "danger");
-    if (authFailure) el.keyHint.textContent = err.message;
+    setPill(el.pillConn, "backend unreachable", "danger");
     if (force) toast("Backend unreachable: " + err.message, "err");
     return false;
   }
 }
 
 async function boot() {
-  el.apiKeyInput.value = apiKey;
   el.sliderOut.textContent = el.angleSlider.value + "°";
   try { await loadConfig(); } catch { /* config optional */ }
   startLive();
@@ -1010,44 +1018,9 @@ async function boot() {
   scheduleFallback();
 }
 
-el.btnSaveKey.addEventListener("click", async () => {
-  apiKey = el.apiKeyInput.value.trim();
-  if (apiKey) sessionStorage.setItem("solarApiKey", apiKey);
-  else sessionStorage.removeItem("solarApiKey");
-  if (liveAbort) liveAbort.abort();
-  el.btnSaveKey.setAttribute("aria-busy", "true");
-  el.keyHint.textContent = apiKey
-    ? "Checking API key…"
-    : "Enter the shared API key from your .env file. It is kept for this browser session only.";
-  try {
-    const connected = await refresh(true);
-    if (apiKey && connected) {
-      startLive();
-      el.keyHint.textContent = "Connected using the configured API key.";
-      el.btnSaveKey.textContent = "Connected";
-      setTimeout(() => { el.btnSaveKey.textContent = "Connect"; }, 2500);
-    } else if (apiKey) {
-      el.btnSaveKey.textContent = "Retry";
-    }
-  } finally {
-    el.btnSaveKey.removeAttribute("aria-busy");
-  }
-});
-
 el.btnNotifications.addEventListener("click", requestNotifPermission);
 el.cmdFilter.addEventListener("change", () => {
   renderTables().catch(err => toast("Could not load command history: " + err.message, "err"));
-});
-
-/* ------------------------------------------------------------------ */
-/* API key visibility toggle                                            */
-/* ------------------------------------------------------------------ */
-el.btnToggleKey.addEventListener("click", () => {
-  const show = el.apiKeyInput.type === "password";
-  el.apiKeyInput.type = show ? "text" : "password";
-  el.btnToggleKey.textContent = show ? "Hide" : "Show";
-  el.btnToggleKey.setAttribute("aria-pressed", String(show));
-  el.btnToggleKey.setAttribute("aria-label", show ? "Hide API key" : "Show API key");
 });
 
 /* ------------------------------------------------------------------ */

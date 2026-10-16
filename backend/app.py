@@ -10,7 +10,6 @@ Responsibilities
 """
 
 import asyncio
-import hmac
 import json
 import os
 import sys
@@ -21,9 +20,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
 
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Security
+from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
-from fastapi.security import APIKeyHeader
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from slowapi import Limiter, _rate_limit_exceeded_handler
@@ -41,7 +39,6 @@ CFG = TrackerConfig()
 DEVICE_ID = os.getenv("SOLAR_DEVICE_ID", "solar-tracker-01")
 OFFLINE_AFTER_S = float(os.getenv("SOLAR_OFFLINE_AFTER", "10"))
 COMMAND_EXPIRE_S = float(os.getenv("SOLAR_COMMAND_EXPIRE", "60"))
-SOLAR_API_KEY = os.getenv("SOLAR_API_KEY", "")
 PRUNE_EVERY = 200
 # Monotonic ingest counter; prune is triggered by ingest volume rather than
 # the device-supplied ``seq`` so a device that omits or resets ``seq`` can
@@ -59,20 +56,6 @@ db = Database(DB_PATH)
 # rate limiter
 # ----------------------------------------------------------------------
 limiter = Limiter(key_func=get_remote_address, default_limits=["200/minute"])
-
-# ----------------------------------------------------------------------
-# API key auth
-# ----------------------------------------------------------------------
-_api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
-
-
-def require_api_key(key: Optional[str] = Security(_api_key_header)) -> None:
-    """Reject protected API access unless a shared secret is configured and supplied."""
-    if not SOLAR_API_KEY or SOLAR_API_KEY == "replace-this-with-a-long-random-secret":
-        raise HTTPException(status_code=503, detail="API authentication is not configured")
-    if not key or not hmac.compare_digest(key.encode(), SOLAR_API_KEY.encode()):
-        raise HTTPException(status_code=401, detail="invalid or missing X-API-Key header")
-
 
 # ----------------------------------------------------------------------
 # models
@@ -339,7 +322,6 @@ def get_config() -> Dict[str, Any]:
 @app.get("/api/state")
 def get_state(
     device_id: str = Query(default=DEVICE_ID, max_length=64),
-    _: None = Depends(require_api_key),
 ) -> Dict[str, Any]:
     return _with_presence(db.get_state(device_id), device_id)
 
@@ -348,7 +330,6 @@ def get_state(
 async def stream_events(
     request: Request,
     last_event_id: Optional[str] = Header(default=None, alias="Last-Event-ID"),
-    _: None = Depends(require_api_key),
 ) -> StreamingResponse:
     """Stream snapshots with resumable sequence IDs for reconnecting clients."""
     try:
@@ -400,22 +381,19 @@ async def stream_events(
 def post_telemetry(
     request: Request,
     t: Telemetry,
-    _: None = Depends(require_api_key),
 ) -> Dict[str, Any]:
     return ingest(t)
 
 
 @app.get("/api/history/light")
 def history_light(limit: int = Query(default=300, ge=1, le=5000),
-                  device_id: str = Query(default=DEVICE_ID, max_length=64),
-                  _: None = Depends(require_api_key)) -> Dict[str, Any]:
+                  device_id: str = Query(default=DEVICE_ID, max_length=64)) -> Dict[str, Any]:
     return {"items": db.recent_light(limit, device_id)}
 
 
 @app.get("/api/history/orientation")
 def history_orientation(
     limit: int = Query(default=200, ge=1, le=2000),
-    _: None = Depends(require_api_key),
 ) -> Dict[str, Any]:
     return {"items": db.recent_orientation(limit)}
 
@@ -423,20 +401,18 @@ def history_orientation(
 @app.get("/api/history/faults")
 def history_faults(
     limit: int = Query(default=100, ge=1, le=1000),
-    _: None = Depends(require_api_key),
 ) -> Dict[str, Any]:
     return {"items": db.recent_faults(limit)}
 
 
 @app.get("/api/history/commands")
 def history_commands(limit: int = Query(default=100, ge=1, le=1000),
-                     status: Optional[str] = Query(default=None, max_length=16),
-                     _: None = Depends(require_api_key)) -> Dict[str, Any]:
+                     status: Optional[str] = Query(default=None, max_length=16)) -> Dict[str, Any]:
     return {"items": db.list_commands(limit, status)}
 
 
 @app.get("/api/summary")
-def summary(_: None = Depends(require_api_key)) -> Dict[str, Any]:
+def summary() -> Dict[str, Any]:
     counts = db.counts()
     return {
         "device_id": DEVICE_ID,
@@ -453,7 +429,6 @@ def summary(_: None = Depends(require_api_key)) -> Dict[str, Any]:
 @app.post("/api/commands", status_code=201)
 def create_command(
     cmd: CommandCreate,
-    _: None = Depends(require_api_key),
 ) -> Dict[str, Any]:
     problems = validate_command(cmd)
     payload = cmd.model_dump(exclude={"source", "device_id"})
@@ -484,12 +459,17 @@ def create_command(
 
 
 @app.get("/api/commands/pending")
+@limiter.limit("600/minute")
 def pending_commands(
+    request: Request,
     device_id: str = Query(default=DEVICE_ID, max_length=64),
     after_id: int = Query(default=0, ge=0),
     limit: int = Query(default=20, ge=1, le=100),
-    _: None = Depends(require_api_key),
 ) -> Dict[str, Any]:
+    # Machine-poll endpoint: the serial bridge polls every 0.25s (240 req/min)
+    # and the simulator every 0.5s (120 req/min).  Without this decorator the
+    # global 200/min default throttles real-hardware command delivery after
+    # ~50s of runtime (slowapi route limits override the default when set).
     return {"items": db.pending_commands(device_id, after_id, limit)}
 
 
@@ -497,7 +477,6 @@ def pending_commands(
 def command_result(
     cmd_id: int,
     body: CommandResult,
-    _: None = Depends(require_api_key),
 ) -> Dict[str, Any]:
     row = db.get_command(cmd_id)
     if row is None:
@@ -515,10 +494,18 @@ def command_result(
 
 
 @app.get("/api/commands/{cmd_id}")
+@limiter.limit("300/minute")
 def get_command(
+    request: Request,
     cmd_id: int,
-    _: None = Depends(require_api_key),
 ) -> Dict[str, Any]:
+    # This route MUST carry a limiter decorator.  slowapi's middleware resolves
+    # the route handler by "last full match", so GET /api/commands/pending is
+    # attributed to this parametric route ({cmd_id}="pending") whenever the
+    # middleware stack evaluates it.  Undecorated, this route made the global
+    # 200/min default apply to the bridge's machine-poll URL and throttled
+    # real-hardware command delivery.  Decorated routes are skipped by the
+    # middleware and limited exactly once by their own decorator.
     row = db.get_command(cmd_id)
     if row is None:
         raise HTTPException(status_code=404, detail="command not found")
@@ -528,13 +515,12 @@ def get_command(
 @app.delete("/api/commands/pending")
 def clear_pending_commands(
     device_id: str = Query(default=DEVICE_ID, max_length=64),
-    _: None = Depends(require_api_key),
 ) -> Dict[str, int]:
     return {"cancelled": db.cancel_pending_commands(device_id)}
 
 
 @app.delete("/api/history")
-def clear_history(_: None = Depends(require_api_key)) -> Dict[str, Dict[str, int]]:
+def clear_history() -> Dict[str, Dict[str, int]]:
     return {"deleted": db.clear_history()}
 
 

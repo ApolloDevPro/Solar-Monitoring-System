@@ -11,7 +11,6 @@ services:
       - SOLAR_DEVICE_ID=${SOLAR_DEVICE_ID:-solar-tracker-01}
       - SOLAR_OFFLINE_AFTER=${SOLAR_OFFLINE_AFTER:-10}
       - SOLAR_COMMAND_EXPIRE=${SOLAR_COMMAND_EXPIRE:-60}
-      - SOLAR_API_KEY=${SOLAR_API_KEY:?Set SOLAR_API_KEY in your .env file}
       - SOLAR_DB_PATH=/app/data/solar_tracker.db
     volumes:
       # Persist the SQLite database across restarts
@@ -25,8 +24,6 @@ services:
   simulator:
     build: .
     command: python -m simulator.device_sim --host backend --port 8000
-    environment:
-      - SOLAR_API_KEY=${SOLAR_API_KEY:?Set SOLAR_API_KEY in your .env file}
     depends_on:
       backend:
         condition: service_healthy

@@ -1,0 +1,17 @@
+[Unit]
+Description=Solar Tracker Monitoring System - FastAPI backend
+After=network.target
+
+[Service]
+Type=simple
+# Adjust these two paths to your install location.
+WorkingDirectory=/opt/solar-monitoring-system
+ExecStart=/usr/bin/python3 -m uvicorn backend.app:app --host 127.0.0.1 --port 8000
+Restart=always
+RestartSec=2
+# Give the SQLite writer a clean shutdown window.
+TimeoutStopSec=10
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

@@ -3,7 +3,12 @@ from __future__ import annotations
 
 from shared.control import MODE_AUTO, MODE_MANUAL, SolarTracker, TrackerConfig
 from simulator.device_sim import apply_command
-from simulator.serial_bridge import command_to_serial, parse_telemetry
+from simulator.serial_bridge import (
+    command_to_serial,
+    enqueue_telemetry,
+    flush_telemetry,
+    parse_telemetry,
+)
 
 # ── apply_command ─────────────────────────────────────────────────────────────
 
@@ -191,3 +196,78 @@ def test_sun_model_annotations_resolve():
 
     hints = get_type_hints(SunModel.__init__)
     assert "fixed" in hints
+
+
+# ── telemetry retry queue ────────────────────────────────────────────────────
+
+class _FakeBackend:
+    """Stands in for simulator.http_client.Backend in queue tests."""
+
+    def __init__(self, ok: bool = True):
+        self.ok = ok
+        self.posts: list = []
+
+    def post(self, path, payload):
+        self.posts.append((path, payload))
+        return self.ok
+
+
+def test_enqueue_telemetry_appends_payload():
+    from collections import deque
+
+    q: deque = deque(maxlen=3)
+    enqueue_telemetry(q, {"seq": 1})
+    enqueue_telemetry(q, {"seq": 2})
+    assert [p["seq"] for p in q] == [1, 2]
+
+
+def test_enqueue_telemetry_bounded_drops_oldest():
+    from collections import deque
+
+    q: deque = deque(maxlen=2)
+    for i in range(5):
+        enqueue_telemetry(q, {"seq": i})
+    assert [p["seq"] for p in q] == [3, 4]
+
+
+def test_flush_telemetry_drains_one_sample_in_order():
+    from collections import deque
+
+    q: deque = deque([{"seq": 1}, {"seq": 2}])
+    backend = _FakeBackend(ok=True)
+    last = flush_telemetry(backend, q, now=10.0, last_flush=0.0, min_interval_s=1.5)
+    assert last == 10.0
+    assert [p["seq"] for p in q] == [2]
+    assert backend.posts == [("/api/telemetry", {"seq": 1})]
+
+
+def test_flush_telemetry_respects_pacing():
+    from collections import deque
+
+    q: deque = deque([{"seq": 1}])
+    backend = _FakeBackend(ok=True)
+    # not enough time elapsed -> nothing sent
+    last = flush_telemetry(backend, q, now=1.0, last_flush=0.0, min_interval_s=1.5)
+    assert last == 0.0
+    assert len(q) == 1
+    assert backend.posts == []
+
+
+def test_flush_telemetry_keeps_queue_on_failure():
+    from collections import deque
+
+    q: deque = deque([{"seq": 1}, {"seq": 2}])
+    backend = _FakeBackend(ok=False)
+    last = flush_telemetry(backend, q, now=10.0, last_flush=0.0, min_interval_s=1.5)
+    assert last == 0.0  # unchanged: backend still down
+    assert [p["seq"] for p in q] == [1, 2]  # order preserved for retry
+
+
+def test_flush_telemetry_empty_queue_is_noop():
+    from collections import deque
+
+    q: deque = deque()
+    backend = _FakeBackend(ok=True)
+    last = flush_telemetry(backend, q, now=10.0, last_flush=0.0, min_interval_s=1.5)
+    assert last == 0.0
+    assert backend.posts == []

@@ -1,0 +1,34 @@
+# nginx reverse-proxy example for remote dashboard access.
+#
+# Terminate TLS here and proxy to the backend on loopback only - never
+# expose uvicorn directly.  Obtain certificates with certbot:
+#   sudo certbot --nginx -d solar.example.com
+#
+# Replace solar.example.com with your hostname.
+
+server {
+    listen 80;
+    server_name solar.example.com;
+    return 301 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl http2;
+    server_name solar.example.com;
+
+    # certbot --nginx inserts the ssl_certificate lines automatically.
+
+    # The SSE live feed needs unbuffered proxying and a long read timeout.
+    location / {
+        proxy_pass         http://127.0.0.1:8000;
+        proxy_http_version 1.1;
+        proxy_set_header   Host              $host;
+        proxy_set_header   X-Real-IP         $remote_addr;
+        proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto $scheme;
+
+        proxy_buffering    off;
+        proxy_cache        off;
+        proxy_read_timeout 3600s;
+    }
+}

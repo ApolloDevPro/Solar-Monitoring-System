@@ -70,12 +70,10 @@ Or run both with the convenience script:
 run_all.bat
 ```
 
-3. The first run will create a `.env` file containing a generated `SOLAR_API_KEY`. Open the dashboard at http://127.0.0.1:8000 in your browser, paste the `SOLAR_API_KEY` into the dashboard's prompt and click Connect. The dashboard keeps the key in session storage only; do not commit `.env` to version control.
+3. Open the dashboard at http://127.0.0.1:8000 — no login or API key is needed. The first run creates `.env` from `.env.example` (optional settings such as `SOLAR_DEVICE_ID` and `SOLAR_DB_PATH`); the simulator and serial bridge load the same local `.env` automatically. Do not commit `.env` to version control.
 
 Notes:
-
-- The backend binds to localhost by default. If you need external access use a trusted reverse proxy with HTTPS — do not expose the backend directly to an untrusted network.
-- Protected API routes require the `X-API-Key` header.
+- The backend binds to localhost by default. There is no authentication on the API. If you need external access use a trusted reverse proxy with HTTPS — do not expose the backend directly to an untrusted network.
 
 ---
 
@@ -101,7 +99,7 @@ python -m uvicorn backend.app:app --host 127.0.0.1 --port 8000
 python -m simulator.serial_bridge --port-name COM5
 ```
 
-6. Open the dashboard, enter `SOLAR_API_KEY`, and Connect. The panel will now show live sensor data.
+6. Open the dashboard at http://127.0.0.1:8000 — the panel will now show live sensor data.
 
 The serial bridge forwards lines between the Arduino and the backend and maps simple `OK`/`ERR` replies back into command results. See "Known Limitations" below for protocol caveats.
 
@@ -129,18 +127,91 @@ python -m simulator.serial_bridge --list
 
 ---
 
+## Unattended Deployment
+
+Ready-made service files live in [`deploy/`](deploy/) so the backend and
+serial bridge survive reboots and auto-restart on crash.
+
+### Windows (Task Scheduler)
+
+```bat
+python ensure_env.py
+powershell -ExecutionPolicy Bypass -File deploy\install_windows_tasks.ps1
+```
+
+Installs `SolarTrackerBackend` and `SolarTrackerBridge` tasks that start at
+logon and restart every minute on failure. Uninstall with `-Uninstall`.
+
+### Linux (systemd)
+
+```bash
+# adjust the paths inside the unit files first
+sudo cp deploy/solar-backend.service deploy/solar-bridge.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now solar-backend solar-bridge
+```
+
+The bridge runs as user `solar` in group `dialout` for serial access.
+
+### Remote access (TLS)
+
+Never expose uvicorn directly. Terminate TLS on a reverse proxy that
+forwards to `127.0.0.1:8000`:
+
+- **Caddy** ([`deploy/Caddyfile`](deploy/Caddyfile)) — automatic Let's Encrypt
+  certificates: `caddy run --config deploy/Caddyfile`
+- **nginx** ([`deploy/nginx.conf.example`](deploy/nginx.conf.example)) —
+  template with SSE-safe settings; pair with `certbot --nginx`
+
+The API has no authentication - anyone who can reach the proxy can read
+data and send commands, so only expose it on networks you trust.
+
+### Bridge logs
+
+The bridge writes rotating logs (`logs/serial_bridge.log`, 1 MB × 3 backups)
+in addition to the console. Tune with `--log-file`, `--log-level`,
+`--queue-size`, and `--flush-interval` (see `python -m simulator.serial_bridge --help`).
+Dropped telemetry (backend outage or rate limit) is queued and retried at a
+paced rate so retries never crowd out fresh samples.
+
+---
+
+## API Reference
+
+| Method | Path | Description |
+|--------|------|-------------|
+| **GET** | `/api/health` | Liveness probe |
+| **GET** | `/api/config` | Returns control thresholds |
+| **GET** | `/api/state` | Current device snapshot |
+| **GET** | `/api/events` | Server‑sent events: live state/counts stream |
+| **POST** | `/api/telemetry` | Device uploads LDR values & angle |
+| **GET** | `/api/history/light` | Time‑series of LDR samples |
+| **GET** | `/api/history/orientation` | Angle & mode changes |
+| **GET** | `/api/history/faults` | Sensor‑fault events |
+| **GET** | `/api/history/commands` | Command audit trail (accepted + refused) |
+| **GET** | `/api/summary` | Counters and statistics |
+| **POST** | `/api/commands` | Send `move`, `set_mode` or `park` commands |
+| **GET** | `/api/commands/pending` | Devices poll queued commands |
+| **GET** | `/api/commands/{id}` | Fetch one command's current status |
+| **POST** | `/api/commands/{id}/result` | Device reports command outcome |
+| **DELETE** | `/api/commands/pending` | Cancel queued commands for a device |
+| **DELETE** | `/api/history` | Clear samples, orientation events, and completed command history |
+
 ## API Examples
+
+Sample telemetry POST payload (JSON):
 
 Sample telemetry POST payload (JSON):
 
 ```json
 {
   "device_id": "solar-tracker-01",
-  "left_ldr": 412,
-  "right_ldr": 378,
+  "ts_ms": 1760619296789,
+  "ldr_left": 412,
+  "ldr_right": 378,
   "angle": 42.5,
-  "mode": "auto",
-  "timestamp": "2026-10-16T12:34:56.789Z"
+  "mode": "AUTO",
+  "tracking_state": "EVALUATING"
 }
 ```
 
@@ -149,13 +220,17 @@ Sample command POST payload (send a move command):
 ```json
 {
   "type": "move",
-  "angle": 75.0
+  "target_angle": 75.0
 }
 ```
 
-Auth: Include the `X-API-Key` HTTP header for all protected routes.
+Rate limits per client IP: telemetry ingestion
+**300/min** (firmware reports at 240/min), `/api/commands/pending`
+**600/min** (machine-poll endpoint; the serial bridge polls at 240/min),
+and a **200/min** global default on every other route. Free-text
+telemetry and command-result fields have length limits.
 
-Rate limits: telemetry endpoints are limited to 300 requests per client IP per minute; other routes default to 200 requests per minute.
+The dashboard reconnects to SSE using the last received event ID, then falls back to adaptive five-second polling while disconnected (backing off further if the backend rate-limits it) and idles at ten seconds while SSE is live. It includes timestamped charts, a fault timeline, CSV/JSON exports, manual angle synchronization, and opt-in browser notifications.
 
 ---
 
@@ -166,7 +241,6 @@ Rate limits: telemetry endpoints are limited to 300 requests per client IP per m
 | `SOLAR_DEVICE_ID` | `solar-tracker-01` | Expected device identifier. Devices that post telemetry must use this id unless your configuration overrides it. |
 | `SOLAR_OFFLINE_AFTER` | `10` | Seconds of inactivity before the device is marked offline in the backend. |
 | `SOLAR_COMMAND_EXPIRE` | `60` | Seconds before a pending command expires if not fetched/executed by the device. |
-| `SOLAR_API_KEY` | Required | Shared secret for protected API routes — generated in `.env` on first run. Keep it private. |
 | `SOLAR_DB_PATH` | `backend/solar_tracker.db` | SQLite database file path. When using Docker the file is persisted in a named volume. |
 
 ---
@@ -220,21 +294,13 @@ All unit and integration tests run against temporary databases and a FastAPI tes
 
 ## Docker
 
-Create `.env` with a generated `SOLAR_API_KEY` via:
-
-```bat
-python ensure_env.py
-```
-
-Then build and run with Docker Compose:
+Run `python ensure_env.py` to create `.env` (optional settings), then run:
 
 ```bat
 docker compose up --build
 ```
 
-When using hardware, run the serial bridge on the host machine and keep the same `.env` file so the bridge and API share the same API key.
-
----
+Docker Compose persists SQLite data in a named volume. For hardware access, run the serial bridge on the host against the same backend.
 
 ## Wiring and Bill of Materials
 
@@ -249,7 +315,7 @@ See `docs/wiring.md` for the wiring schematic, connector pinouts, and the compon
 - Serial command correlation: the Arduino serial protocol has no command IDs; the serial bridge attributes `OK`/`ERR` replies FIFO to pending commands. Unsolicited `OK` messages from debug commands can be misattributed.
 
 Troubleshooting tips:
-- If the dashboard reports "offline", confirm the device is posting telemetry and that the `SOLAR_API_KEY` in `.env` matches the dashboard key.
+- If the dashboard reports "offline", confirm the device is posting telemetry (check the backend and bridge logs — the bridge writes to `logs/serial_bridge.log`) and that no other process holds the serial port.
 - If using hardware and the bridge fails to open a port, make sure no other process (e.g., Arduino IDE Serial Monitor) has the port open and verify driver installation.
 
 ---
@@ -260,7 +326,7 @@ Troubleshooting tips:
 - firmware/ — Arduino sketch and build instructions
 - simulator/ — device simulator and serial bridge
 - shared/ — control logic and shared types
-- frontend/ — dashboard UI (static files served by backend)
+- dashboard/ — dashboard UI (static files served by backend)
 - tests/ — pytest test suites
 - docs/ — wiring diagrams, BOM and notes
 

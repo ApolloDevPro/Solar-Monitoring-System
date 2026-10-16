@@ -1,0 +1,20 @@
+# Caddy reverse-proxy config for remote dashboard access.
+#
+# Caddy obtains and renews Let's Encrypt certificates automatically - no
+# cert files to manage.  Install Caddy, then:
+#
+#   caddy run --config deploy/Caddyfile
+#
+# Replace solar.example.com with your hostname (DNS A record must point
+# at this machine).  Note: the API has no authentication - anyone who can
+# reach this hostname can read data and send commands, so only expose it
+# on networks you trust.
+
+solar.example.com {
+	reverse_proxy 127.0.0.1:8000
+
+	# Optional hardening: basic request logging to the journal.
+	log {
+		output stdout
+	}
+}
