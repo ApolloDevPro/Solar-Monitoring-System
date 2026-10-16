@@ -5,6 +5,7 @@ Runs entirely in-process using httpx + FastAPI TestClient — no live server nee
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from fastapi.testclient import TestClient
@@ -12,7 +13,9 @@ from starlette.requests import Request
 
 import backend.app as app_module
 
-# Import after conftest.py ensures project root is on sys.path
+# pytest's default "prepend" import mode puts the project root on sys.path
+# because tests/ is a package (has __init__.py); conftest.py only disables
+# rate limiting for the session.
 from backend.database import Database
 
 
@@ -329,3 +332,140 @@ def test_z_telemetry_rate_limit(client):
         assert 429 in statuses
     finally:
         app_module.limiter.enabled = False
+
+
+# ── regressions for the Phase 1-4 fixes ──────────────────────────────────────
+def test_rate_limit_middleware_is_registered():
+    # SlowAPIMiddleware must be present or the configured default_limits
+    # (200/minute on every route) would silently do nothing.
+    from slowapi.middleware import SlowAPIMiddleware
+
+    assert any(m.cls is SlowAPIMiddleware for m in app_module.app.user_middleware)
+
+
+def test_command_rejected_when_device_offline(client):
+    post_telemetry(client)  # device online (AUTO mode)
+    # Backdate last_seen well past SOLAR_OFFLINE_AFTER (10s default).
+    state = app_module.db.get_state("solar-tracker-01")
+    state["last_seen"] = (
+        datetime.now(timezone.utc) - timedelta(seconds=30)
+    ).isoformat(timespec="milliseconds")
+    app_module.db.upsert_state(state)
+
+    r = client.post("/api/commands", json={"type": "park"})
+    assert r.status_code == 201
+    body = r.json()
+    assert body["accepted"] is False
+    assert "offline" in body["reason"]
+    # The refusal is persisted with its reason (audited-refusal requirement).
+    row = client.get(f"/api/commands/{body['command']['id']}").json()["command"]
+    assert row["status"] == "REJECTED"
+
+
+def test_rejected_command_is_recorded_and_counted(client):
+    post_telemetry(client)  # AUTO mode
+    r = client.post("/api/commands", json={"type": "move", "target_angle": 140})
+    assert r.status_code == 201
+    body = r.json()
+    assert body["accepted"] is False
+    cmd_id = body["command"]["id"]
+
+    row = client.get(f"/api/commands/{cmd_id}").json()["command"]
+    assert row["status"] == "REJECTED"
+    assert "MANUAL" in row["reason"]
+
+    summary = client.get("/api/summary").json()
+    assert summary["commands_rejected"] >= 1
+
+    hist = client.get("/api/history/commands?status=REJECTED").json()
+    assert any(c["id"] == cmd_id for c in hist["items"])
+
+
+def test_command_result_state_machine(client):
+    post_telemetry(client, {"mode": "MANUAL", "tracking_state": "MANUAL"})
+    r = client.post("/api/commands", json={"type": "move", "target_angle": 120})
+    cmd_id = r.json()["command"]["id"]
+
+    # First report from PENDING succeeds.
+    ok = client.post(
+        f"/api/commands/{cmd_id}/result",
+        json={"status": "EXECUTED", "reason": "done"},
+    )
+    assert ok.status_code == 200
+    assert ok.json()["command"]["status"] == "EXECUTED"
+
+    # A duplicate / late report on a terminal command must be refused.
+    again = client.post(
+        f"/api/commands/{cmd_id}/result",
+        json={"status": "REJECTED", "reason": "late"},
+    )
+    assert again.status_code == 409
+    # ...and the original status is unchanged.
+    row = client.get(f"/api/commands/{cmd_id}").json()["command"]
+    assert row["status"] == "EXECUTED"
+
+
+def test_command_result_on_expired_command_is_refused(client):
+    post_telemetry(client, {"mode": "MANUAL", "tracking_state": "MANUAL"})
+    r = client.post("/api/commands", json={"type": "park"})
+    cmd_id = r.json()["command"]["id"]
+
+    # Simulate the expiry reaper having already claimed the command.
+    future = (datetime.now(timezone.utc) + timedelta(seconds=1)).isoformat(
+        timespec="milliseconds"
+    )
+    app_module.db.expire_stale_commands(future)
+
+    late = client.post(
+        f"/api/commands/{cmd_id}/result", json={"status": "EXECUTED"}
+    )
+    assert late.status_code == 409
+    row = client.get(f"/api/commands/{cmd_id}").json()["command"]
+    assert row["status"] == "EXPIRED"
+
+
+def test_non_ascii_api_key_does_not_500():
+    # hmac.compare_digest on plain str used to raise TypeError for non-ASCII
+    # input, turning key mismatches into 500s.  With .encode() both sides are
+    # bytes, so a non-ASCII *stored* key still yields a clean 401 and a
+    # matching non-ASCII pair still authenticates.  (HTTP headers themselves
+    # are ASCII-only, so this exercises require_api_key directly.)
+    from fastapi import HTTPException
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(app_module, "SOLAR_API_KEY", "sécret-key-✓")
+        with pytest.raises(HTTPException) as exc:
+            app_module.require_api_key("wrong-key")
+        assert exc.value.status_code == 401
+        # Matching non-ASCII pair must authenticate (no TypeError/500).
+        assert app_module.require_api_key("sécret-key-✓") is None
+
+
+def test_state_unknown_device_echoes_requested_id(client):
+    r = client.get("/api/state", params={"device_id": "ghost-unit"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["device_id"] == "ghost-unit"
+    assert body["is_online"] is False
+
+
+def test_prune_keeps_pending_commands(client, monkeypatch):
+    # Queue several commands, force a prune with a tiny cap, and make sure
+    # PENDING work is never silently dropped.
+    post_telemetry(client, {"mode": "MANUAL", "tracking_state": "MANUAL"})
+    for _ in range(3):
+        client.post("/api/commands", json={"type": "park"})
+    pending_before = {
+        c["id"] for c in client.get("/api/commands/pending").json()["items"]
+    }
+    assert pending_before
+
+    from backend.database import MAX_ROWS
+
+    monkeypatch.setitem(MAX_ROWS, "commands", 1)  # force aggressive pruning
+    app_module.db.prune()
+
+    pending_after = {
+        c["id"] for c in client.get("/api/commands/pending").json()["items"]
+    }
+    assert pending_after == pending_before

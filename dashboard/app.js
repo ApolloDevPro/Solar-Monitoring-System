@@ -35,6 +35,7 @@ const el = {
   btnResync: $("btnResync"),
   apiKeyInput: $("apiKeyInput"),
   btnSaveKey: $("btnSaveKey"),
+  btnToggleKey: $("btnToggleKey"),
   keyHint: $("keyHint"),
   btnNotifications: $("btnNotifications"),
   moveHint: $("moveHint"),
@@ -46,8 +47,11 @@ const el = {
   stAutoTime: $("stAutoTime"),
   lightChart: $("lightChart"),
   angleChart: $("angleChart"),
+  lightReadout: $("lightReadout"),
+  angleReadout: $("angleReadout"),
   cmdTable: $("cmdTable").querySelector("tbody"),
   cmdFilter: $("cmdFilter"),
+  cmdCount: $("cmdCount"),
   orientTable: $("orientTable").querySelector("tbody"),
   faultTable: $("faultTable").querySelector("tbody"),
   cfgGrid: $("cfgGrid"),
@@ -62,6 +66,7 @@ let lastEventId = sessionStorage.getItem("solarLastEventId") || "";
 let liveAbort = null;
 let liveRunning = false;
 let fallbackTimer = null;
+let cmdBusy = false;   // a command POST is in flight (blocks double-submit)
 
 /* ------------------------------------------------------------------ */
 /* helpers                                                             */
@@ -99,6 +104,17 @@ function toast(msg, kind = "ok") {
     el.toast.className = "toast " + kind;
   }, 3800);
 }
+// Clicking (or pressing Escape) dismisses the toast early.
+el.toast.addEventListener("click", () => {
+  clearTimeout(toastTimer);
+  el.toast.classList.remove("show");
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") {
+    clearTimeout(toastTimer);
+    el.toast.classList.remove("show");
+  }
+});
 
 function setPill(node, text, kind) {
   node.textContent = text;
@@ -253,14 +269,16 @@ function renderState(s) {
     el.alignNote.textContent = "Waiting for light sensor readings";
   }
 
-  // keep mode buttons in sync
+  // keep mode buttons in sync; disable them while the device is offline or
+  // a command is still in flight (the backend would reject them anyway)
+  const manual = mode === "MANUAL";
   for (const btn of el.modeSwitch.querySelectorAll("button")) {
     btn.classList.toggle("active", btn.dataset.mode === mode);
+    btn.disabled = !online || cmdBusy;
   }
-  const manual = mode === "MANUAL";
-  el.angleSlider.disabled = !manual || !online;
-  el.btnMove.disabled = !manual || !online;
-  el.btnPark.disabled = !manual || !online;
+  el.angleSlider.disabled = !manual || !online || cmdBusy;
+  el.btnMove.disabled = !manual || !online || cmdBusy;
+  el.btnPark.disabled = !manual || !online || cmdBusy;
   el.moveHint.textContent = manual
     ? (online
         ? "Manual mode: direct moves and park are accepted."
@@ -286,6 +304,9 @@ function renderState(s) {
 /* ------------------------------------------------------------------ */
 /* charts (pure canvas, no external libs)                              */
 /* ------------------------------------------------------------------ */
+const CHART_PAD_L = 44;
+const CHART_PAD_R = 10;
+
 function drawChart(canvas, seriesList, opts = {}) {
   const dpr = window.devicePixelRatio || 1;
   const cssW = canvas.clientWidth || 600;
@@ -297,8 +318,8 @@ function drawChart(canvas, seriesList, opts = {}) {
 
   const W = cssW;
   const H = cssH;
-  const padL = 44;
-  const padR = 10;
+  const padL = CHART_PAD_L;
+  const padR = CHART_PAD_R;
   const padT = 12;
   const padB = 36;  // increased from 24 to make room for X-axis time labels
   const plotW = W - padL - padR;
@@ -383,6 +404,30 @@ function drawChart(canvas, seriesList, opts = {}) {
     }
   }
 
+  // hover crosshair marker (driven by pointermove on the canvas)
+  if (opts.markerIndex != null && opts.markerIndex >= 0 && opts.markerIndex < rows) {
+    const mx = xOf(opts.markerIndex);
+    ctx.strokeStyle = "rgba(230, 237, 249, .45)";
+    ctx.lineWidth = 1;
+    ctx.setLineDash([3, 3]);
+    ctx.beginPath();
+    ctx.moveTo(mx, padT);
+    ctx.lineTo(mx, padT + plotH);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    for (const s of seriesList) {
+      const v = s.points[opts.markerIndex];
+      if (v == null) continue;
+      ctx.fillStyle = s.color;
+      ctx.beginPath();
+      ctx.arc(mx, yOf(v), 3.5, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.strokeStyle = "#070b14";
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+    }
+  }
+
   // legend
   ctx.font = "11px Segoe UI, sans-serif";
   let lx = padL;
@@ -411,6 +456,86 @@ function drawChart(canvas, seriesList, opts = {}) {
   }
 }
 
+// Each chart keeps its latest data so we can repaint it on window resize
+// and paint hover crosshairs without re-fetching anything from the backend.
+const charts = {
+  light: { canvas: el.lightChart, readout: el.lightReadout, marker: null, data: null },
+  angle: { canvas: el.angleChart, readout: el.angleReadout, marker: null, data: null },
+};
+
+function paint(ch) {
+  if (!ch.data) return;
+  drawChart(ch.canvas, ch.data.series, { ...ch.data.opts, markerIndex: ch.marker });
+}
+
+function updateReadout(ch) {
+  const d = ch.data;
+  if (!d || !d.series.length || !d.series[0].points.length) return;
+  const n = d.series[0].points.length;
+  const i = ch.marker != null ? Math.max(0, Math.min(ch.marker, n - 1)) : n - 1;
+  const time = (d.opts.labels && d.opts.labels[i]) || "";
+  const where = ch.marker != null ? "" : " · latest";
+  if (ch === charts.light && d.series.length > 1) {
+    const l = d.series[0].points[i];
+    const r = d.series[1].points[i];
+    const diff = r - l;
+    ch.readout.innerHTML =
+      esc(time) + " · <b>L " + l + "</b> · <b>R " + r + "</b> · Δ " +
+      (diff >= 0 ? "+" : "") + diff + esc(where);
+  } else {
+    const a = d.series[0].points[i];
+    ch.readout.innerHTML =
+      esc(time) + " · <b>" + Number(a).toFixed(1) + "°</b>" + esc(where);
+  }
+}
+
+function redrawCharts() {
+  for (const ch of Object.values(charts)) {
+    paint(ch);
+    updateReadout(ch);
+  }
+}
+
+// Mouse crosshair: inspect any point without clicking (touch devices keep
+// the plain view — pointermove during scroll would otherwise jitter).
+function attachCrosshair(ch) {
+  ch.canvas.addEventListener("pointermove", (e) => {
+    if (e.pointerType !== "mouse" || !ch.data) return;
+    const n = ch.data.series[0].points.length;
+    if (n < 2) return;
+    const rect = ch.canvas.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    const plotW = Math.max(1, rect.width - CHART_PAD_L - CHART_PAD_R);
+    const idx = Math.round(((x - CHART_PAD_L) / plotW) * (n - 1));
+    const clamped = Math.max(0, Math.min(n - 1, idx));
+    if (ch.marker !== clamped) {
+      ch.marker = clamped;
+      paint(ch);
+      updateReadout(ch);
+    }
+  });
+  ch.canvas.addEventListener("pointerleave", () => {
+    if (ch.marker != null) {
+      ch.marker = null;
+      paint(ch);
+      updateReadout(ch);
+    }
+  });
+}
+attachCrosshair(charts.light);
+attachCrosshair(charts.angle);
+
+// Repaint (never re-fetch) when the viewport changes: rotation, split-screen
+// resize or scrollbar appearance would otherwise leave a stretched bitmap.
+let resizeTimer = null;
+window.addEventListener("resize", () => {
+  clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(() => {
+    redrawCharts();
+    measureTopbar();
+  }, 150);
+});
+
 async function renderCharts() {
   const [light, orient] = await Promise.all([
     getJSON("/api/history/light?limit=" + HIST_LIMIT),
@@ -419,18 +544,26 @@ async function renderCharts() {
   const L = light.items || [];
   const O = orient.items || [];
 
-  // Extract time labels (show every Nth to avoid clutter)
-  const lightLabels = L.map(r => fmtTime(r.ts));
-  const orientLabels = O.map(r => fmtTime(r.ts));
+  charts.light.data = {
+    series: [
+      { name: "left LDR", color: "#22d3ee", points: L.map(r => r.ldr_left) },
+      { name: "right LDR", color: "#ffb020", points: L.map(r => r.ldr_right) },
+    ],
+    opts: { min: 0, max: 1023, labels: L.map(r => fmtTime(r.ts)) },
+  };
+  charts.angle.data = {
+    series: [
+      { name: "angle °", color: "#7c3aed", points: O.map(r => r.angle), width: 2.5 },
+    ],
+    opts: { min: 0, max: 180, labels: O.map(r => fmtTime(r.ts)) },
+  };
 
-  drawChart(el.lightChart, [
-    { name: "left LDR", color: "#22d3ee", points: L.map(r => r.ldr_left) },
-    { name: "right LDR", color: "#ffb020", points: L.map(r => r.ldr_right) },
-  ], { min: 0, max: 1023, labels: lightLabels });
-
-  drawChart(el.angleChart, [
-    { name: "angle °", color: "#7c3aed", points: O.map(r => r.angle), width: 2.5 },
-  ], { min: 0, max: 180, labels: orientLabels });
+  // Drop a hover marker that fell off the end of a shorter payload.
+  for (const ch of Object.values(charts)) {
+    const n = ch.data.series[0].points.length;
+    if (ch.marker != null && ch.marker >= n) ch.marker = null;
+  }
+  redrawCharts();
 }
 
 /* ------------------------------------------------------------------ */
@@ -468,9 +601,13 @@ async function renderTables() {
   ]);
 
   const filter = el.cmdFilter.value;
-  const filteredCommands = (cmds.items || []).filter(c =>
+  const allCommands = cmds.items || [];
+  const filteredCommands = allCommands.filter(c =>
     filter === "all" || c.status === filter
   );
+  el.cmdCount.textContent = filter === "all"
+    ? String(allCommands.length)
+    : filteredCommands.length + " / " + allCommands.length;
   const crows = filteredCommands.map((c) =>
     "<tr><td class='id-cell'>" + c.id + "</td><td title='" + esc(c.ts) + "'>" +
     fmtDateTime(c.ts) + "</td><td><span class='command-type'>" + esc(c.type) +
@@ -566,12 +703,16 @@ async function loadConfig() {
     .join("");
   el.angleSlider.min = cfg.soft_min;
   el.angleSlider.max = cfg.soft_max;
+  el.btnPark.textContent = "Park at " + (cfg.park_angle ?? 90) + "°";
 }
 
 /* ------------------------------------------------------------------ */
 /* commands                                                            */
 /* ------------------------------------------------------------------ */
-async function sendCommand(payload) {
+async function sendCommand(payload, btn) {
+  if (cmdBusy) return null;  // ignore rapid double-clicks while a POST is live
+  cmdBusy = true;
+  if (btn) btn.setAttribute("aria-busy", "true");
   try {
     const body = await getJSON("/api/commands", {
       method: "POST",
@@ -580,6 +721,7 @@ async function sendCommand(payload) {
     });
     if (body.accepted) {
       toast("Command #" + body.command.id + " accepted (" + payload.type + ")");
+      trackCommand(body.command.id);  // follow up: PENDING → EXECUTED / EXPIRED / REJECTED
     } else {
       toast("Rejected: " + (body.reason || "unknown reason"), "err");
     }
@@ -588,6 +730,33 @@ async function sendCommand(payload) {
   } catch (err) {
     toast("Network error: " + err.message, "err");
     return null;
+  } finally {
+    cmdBusy = false;
+    if (btn) btn.removeAttribute("aria-busy");
+    if (lastState) renderState(lastState);  // restore correct enabled/disabled state
+  }
+}
+
+// After an accepted command, poll its status so the user sees the outcome
+// instead of a silent PENDING row (device ack / expiry / rejection arrive
+// seconds later).  One GET every 2s stays far below the rate limits.
+async function trackCommand(id) {
+  for (let i = 0; i < 30; i++) {   // 30 × 2s covers the 60s expiry window
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+    let cmd = null;
+    try {
+      cmd = (await getJSON("/api/commands/" + id)).command;
+    } catch (err) {
+      if (err.status === 429) continue;  // throttled: just wait longer
+      return;  // 404/5xx: stop quietly, the table still shows the row
+    }
+    if (!cmd) return;
+    if (cmd.status === "PENDING") continue;
+    const kind = cmd.status === "EXECUTED" ? "ok" : "err";
+    toast("Command #" + id + " " + cmd.status.toLowerCase() +
+      (cmd.reason ? " — " + cmd.reason : ""), kind);
+    renderTables().catch(() => {});
+    return;
   }
 }
 
@@ -597,7 +766,7 @@ el.angleSlider.addEventListener("input", () => {
 
 for (const btn of el.modeSwitch.querySelectorAll("button")) {
   btn.addEventListener("click", () => {
-    sendCommand({ type: "set_mode", mode: btn.dataset.mode });
+    sendCommand({ type: "set_mode", mode: btn.dataset.mode }, btn);
   });
 }
 
@@ -605,11 +774,11 @@ el.btnMove.addEventListener("click", () => {
   sendCommand({
     type: "move",
     target_angle: Number(el.angleSlider.value),
-  });
+  }, el.btnMove);
 });
 
 el.btnPark.addEventListener("click", () => {
-  sendCommand({ type: "park" });
+  sendCommand({ type: "park" }, el.btnPark);
 });
 
 el.btnResync.addEventListener("click", async () => {
@@ -846,13 +1015,22 @@ el.btnSaveKey.addEventListener("click", async () => {
   if (apiKey) sessionStorage.setItem("solarApiKey", apiKey);
   else sessionStorage.removeItem("solarApiKey");
   if (liveAbort) liveAbort.abort();
+  el.btnSaveKey.setAttribute("aria-busy", "true");
   el.keyHint.textContent = apiKey
     ? "Checking API key…"
     : "Enter the shared API key from your .env file. It is kept for this browser session only.";
-  const connected = await refresh(true);
-  if (apiKey && connected) {
-    startLive();
-    el.keyHint.textContent = "Connected using the configured API key.";
+  try {
+    const connected = await refresh(true);
+    if (apiKey && connected) {
+      startLive();
+      el.keyHint.textContent = "Connected using the configured API key.";
+      el.btnSaveKey.textContent = "Connected";
+      setTimeout(() => { el.btnSaveKey.textContent = "Connect"; }, 2500);
+    } else if (apiKey) {
+      el.btnSaveKey.textContent = "Retry";
+    }
+  } finally {
+    el.btnSaveKey.removeAttribute("aria-busy");
   }
 });
 
@@ -860,5 +1038,55 @@ el.btnNotifications.addEventListener("click", requestNotifPermission);
 el.cmdFilter.addEventListener("change", () => {
   renderTables().catch(err => toast("Could not load command history: " + err.message, "err"));
 });
+
+/* ------------------------------------------------------------------ */
+/* API key visibility toggle                                            */
+/* ------------------------------------------------------------------ */
+el.btnToggleKey.addEventListener("click", () => {
+  const show = el.apiKeyInput.type === "password";
+  el.apiKeyInput.type = show ? "text" : "password";
+  el.btnToggleKey.textContent = show ? "Hide" : "Show";
+  el.btnToggleKey.setAttribute("aria-pressed", String(show));
+  el.btnToggleKey.setAttribute("aria-label", show ? "Hide API key" : "Show API key");
+});
+
+/* ------------------------------------------------------------------ */
+/* section sub-nav: topbar height + scroll spy                         */
+/* ------------------------------------------------------------------ */
+function measureTopbar() {
+  const bar = document.querySelector(".topbar");
+  if (!bar) return;
+  document.documentElement.style.setProperty("--topbar-h", bar.offsetHeight + "px");
+}
+measureTopbar();
+if ("ResizeObserver" in window) {
+  new ResizeObserver(measureTopbar).observe(document.querySelector(".topbar"));
+}
+
+const subnavLinks = Array.from(document.querySelectorAll(".subnav a"));
+const spyTargets = subnavLinks
+  .map((a) => document.querySelector(a.getAttribute("href")))
+  .filter(Boolean);
+if ("IntersectionObserver" in window && spyTargets.length) {
+  const spy = new IntersectionObserver(
+    (entries) => {
+      for (const entry of entries) {
+        if (!entry.isIntersecting) continue;
+        const hash = "#" + entry.target.id;
+        for (const a of subnavLinks) {
+          a.classList.toggle("active", a.getAttribute("href") === hash);
+        }
+      }
+    },
+    { rootMargin: "-45% 0px -50% 0px", threshold: 0 }
+  );
+  spyTargets.forEach((section) => spy.observe(section));
+}
+// A fresh click is authoritative — update the highlight immediately.
+for (const a of subnavLinks) {
+  a.addEventListener("click", () => {
+    subnavLinks.forEach((x) => x.classList.toggle("active", x === a));
+  });
+}
 
 boot();

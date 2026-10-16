@@ -95,6 +95,31 @@ def test_expire_stale_commands(db):
     assert count >= 1
 
 
+def test_expire_spares_fresh_commands(db):
+    cmd = db.create_command("d", "park", {}, "dashboard", "PENDING", None)
+    # Cutoff 10s in the past: nothing just-created is old enough to expire.
+    from datetime import datetime, timedelta, timezone
+    past = (datetime.now(timezone.utc) - timedelta(seconds=10)).isoformat(
+        timespec="milliseconds"
+    )
+    assert db.expire_stale_commands(past) == 0
+    assert db.get_command(cmd["id"])["status"] == "PENDING"
+    assert any(c["id"] == cmd["id"] for c in db.pending_commands("d", 0, 10))
+
+
+def test_expired_command_leaves_pending_queue(db):
+    cmd = db.create_command("d", "park", {}, "dashboard", "PENDING", None)
+    from datetime import datetime, timedelta, timezone
+    future = (datetime.now(timezone.utc) + timedelta(seconds=1)).isoformat(
+        timespec="milliseconds"
+    )
+    assert db.expire_stale_commands(future) == 1
+    row = db.get_command(cmd["id"])
+    assert row["status"] == "EXPIRED"
+    assert "did not acknowledge" in row["reason"]
+    assert db.pending_commands("d", 0, 10) == []
+
+
 def test_counts(db):
     db.add_light_sample({"device_id": "d", "ts": utcnow(), "ts_ms": 1,
                           "ldr_left": 1, "ldr_right": 2, "difference": 1})
@@ -102,16 +127,13 @@ def test_counts(db):
     assert c["light_samples"] >= 1
 
 
-def test_prune_removes_old_rows(db):
+def test_prune_removes_old_rows(db, monkeypatch):
     for i in range(10):
         db.add_light_sample({"device_id": "d", "ts": utcnow(), "ts_ms": i,
                               "ldr_left": i, "ldr_right": i, "difference": 0})
-    # Prune with max=5
     from backend.database import MAX_ROWS
-    original = MAX_ROWS["light_samples"]
-    MAX_ROWS["light_samples"] = 5
+    monkeypatch.setitem(MAX_ROWS, "light_samples", 5)
     db.prune()
-    MAX_ROWS["light_samples"] = original
     rows = db.recent_light(100, "d")
     assert len(rows) <= 5
 

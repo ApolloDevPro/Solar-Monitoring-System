@@ -141,3 +141,53 @@ def test_command_to_serial_park():
 def test_command_to_serial_unknown():
     result = command_to_serial({"type": "explode", "payload": {}})
     assert result is None
+
+
+def test_sun_model_fixed_value():
+    from simulator.device_sim import SunModel
+
+    assert SunModel(fixed=45.0).azimuth() == 45.0
+
+
+def test_sun_model_full_period_sweeps_once():
+    # Regression: a doubled phase factor made the sun sweep twice as fast.
+    # azimuth(t) = 90 + 70*sin(2*pi*t/period); check the four quarter marks.
+    import time
+
+    import pytest
+
+    from simulator.device_sim import SunModel
+
+    period = 90.0
+    sun = SunModel(period_s=period)
+    t_now = time.monotonic
+
+    # t=0 (just constructed) -> sin(0)=0 -> 90
+    assert sun.azimuth() == pytest.approx(90.0, abs=1.0)
+
+    # quarter period -> sin(pi/2)=1 -> 160
+    sun.t0 = t_now() - period / 4
+    assert sun.azimuth() == pytest.approx(160.0, abs=1.0)
+
+    # half period -> sin(pi)=0 -> 90
+    sun.t0 = t_now() - period / 2
+    assert sun.azimuth() == pytest.approx(90.0, abs=1.0)
+
+    # three-quarter period -> sin(3*pi/2)=-1 -> 20
+    sun.t0 = t_now() - 3 * period / 4
+    assert sun.azimuth() == pytest.approx(20.0, abs=1.0)
+
+    # full period -> back to start (a doubled phase would land at 360/720)
+    sun.t0 = t_now() - period
+    assert sun.azimuth() == pytest.approx(90.0, abs=1.0)
+
+
+def test_sun_model_annotations_resolve():
+    # Regression: `Optional` was used before being imported, so the module
+    # failed at import time with a NameError under from __future__ annotations.
+    from typing import get_type_hints
+
+    from simulator.device_sim import SunModel
+
+    hints = get_type_hints(SunModel.__init__)
+    assert "fixed" in hints

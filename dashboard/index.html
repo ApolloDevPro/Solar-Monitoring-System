@@ -3,6 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="theme-color" content="#070b14" />
   <title>Automatic Solar Tracking System</title>
   <link rel="stylesheet" href="style.css" />
 </head>
@@ -25,9 +26,18 @@
     </div>
   </header>
 
+  <nav class="subnav" id="subnav" aria-label="Dashboard sections">
+    <a href="#live" class="active">Live</a>
+    <a href="#control">Control</a>
+    <a href="#charts">Charts</a>
+    <a href="#commands">Commands</a>
+    <a href="#faults">Faults</a>
+    <a href="#config">Config</a>
+  </nav>
+
   <main>
     <!--  live tiles  -->
-    <section class="tiles" id="tiles">
+    <section class="tiles" id="live" aria-label="Live readings">
       <article class="tile">
         <span class="tile-label">LDR Left</span>
         <strong class="tile-value" id="vLeft">—</strong>
@@ -90,7 +100,7 @@
         </div>
       </section>
 
-      <section class="card">
+      <section class="card" id="control">
         <h2>Remote control <small>Commands are validated, stored and answered with a reason</small></h2>
 
         <div class="control-block">
@@ -98,16 +108,18 @@
           <div class="row">
             <input id="apiKeyInput" type="password" autocomplete="current-password"
                    placeholder="Enter SOLAR_API_KEY" />
-            <button class="btn btn-ghost" id="btnSaveKey">Connect</button>
+            <button class="btn btn-ghost" id="btnToggleKey" type="button"
+                    aria-label="Show API key" aria-pressed="false">Show</button>
+            <button class="btn btn-ghost" id="btnSaveKey" type="button">Connect</button>
           </div>
-          <p class="hint" id="keyHint">Enter the shared API key from your .env file. It is kept for this browser session only.</p>
+          <p class="hint" id="keyHint" aria-live="polite">Enter the shared API key from your .env file. It is kept for this browser session only.</p>
         </div>
 
         <div class="control-block">
           <label class="control-label">Control mode</label>
           <div class="segmented" id="modeSwitch">
-            <button data-mode="AUTO" class="btn">AUTO</button>
-            <button data-mode="MANUAL" class="btn">MANUAL</button>
+            <button data-mode="AUTO" class="btn" type="button" disabled>AUTO</button>
+            <button data-mode="MANUAL" class="btn" type="button" disabled>MANUAL</button>
           </div>
           <p class="hint" id="modeHint">AUTO Lets the Controller follow the stronger Light source.</p>
         </div>
@@ -116,13 +128,14 @@
           <label class="control-label" for="angleSlider">
             Manual panel position <output id="sliderOut">90°</output>
           </label>
-          <input type="range" id="angleSlider" min="10" max="170" step="1" value="90" />
+          <input type="range" id="angleSlider" min="10" max="170" step="1" value="90"
+                 aria-label="Target panel angle in degrees" disabled />
           <div class="row">
-            <button class="btn btn-primary" id="btnMove">Move Panel</button>
-            <button class="btn" id="btnPark">Park at 90°</button>
-            <button class="btn btn-ghost" id="btnResync">Refresh State</button>
+            <button class="btn btn-primary" id="btnMove" type="button" disabled>Move Panel</button>
+            <button class="btn" id="btnPark" type="button" disabled>Park at 90°</button>
+            <button class="btn btn-ghost" id="btnResync" type="button">Refresh State</button>
           </div>
-          <p class="hint" id="moveHint">Direct moves are only accepted while the device is in MANUAL mode.</p>
+          <p class="hint" id="moveHint" aria-live="polite">Direct moves are only accepted while the device is in MANUAL mode.</p>
         </div>
 
         <div class="control-block stats">
@@ -140,36 +153,41 @@
     </div>
 
     <!-- ============ charts ============ -->
-    <div class="grid-2">
+    <div class="grid-2" id="charts">
       <section class="card">
         <h2>Light Measurements <small>Both LDR readings over time</small></h2>
-        <canvas id="lightChart" height="230"></canvas>
+        <p class="chart-readout" id="lightReadout">Waiting for light sensor readings…</p>
+        <canvas id="lightChart" height="230" role="img"
+                aria-label="Line chart of left and right LDR readings over time"></canvas>
       </section>
       <section class="card">
         <h2>Orientation History <small>Servo angle over time</small></h2>
-        <canvas id="angleChart" height="230"></canvas>
+        <p class="chart-readout" id="angleReadout">Waiting for orientation history…</p>
+        <canvas id="angleChart" height="230" role="img"
+                aria-label="Line chart of the servo panel angle over time"></canvas>
       </section>
     </div>
 
     <!-- ============ tables ============ -->
-    <section class="card">
+    <section class="card" id="commands">
       <div class="section-heading">
         <h2>Command history <small>Track requests sent to the device and their results</small></h2>
         <label class="filter-control" for="cmdFilter">
           Status
           <select id="cmdFilter">
-            <option value="all">All commands</option>
+            <option value="all">All Commands</option>
             <option value="PENDING">Pending</option>
             <option value="EXECUTED">Executed</option>
             <option value="REJECTED">Rejected</option>
             <option value="FAILED">Failed</option>
             <option value="EXPIRED">Expired</option>
           </select>
+          <span class="count-badge" id="cmdCount" aria-live="polite">0</span>
         </label>
       </div>
       <div class="row export-actions">
-        <button class="btn btn-ghost" id="btnExportLightCSV">Export light CSV</button>
-        <button class="btn btn-ghost" id="btnExportOrientCSV">Export orientation CSV</button>
+        <button class="btn btn-ghost" id="btnExportLightCSV">Export Light CSV</button>
+        <button class="btn btn-ghost" id="btnExportOrientCSV">Export Orientation CSV</button>
         <button class="btn btn-ghost" id="btnExportJSON">Export JSON</button>
       </div>
       <div class="table-wrap">
@@ -186,7 +204,7 @@
     </section>
 
     <section class="card">
-      <h2>Orientation history log <small>every angle / mode / tracking-state transition</small></h2>
+      <h2>Orientation History Log <small>Every Angle / Mode / Tracking-State Transition</small></h2>
       <div class="table-wrap">
         <table id="orientTable">
           <thead>
@@ -197,8 +215,8 @@
       </div>
     </section>
 
-    <section class="card">
-      <h2>Fault timeline <small>Recorded sensor-fault events</small></h2>
+    <section class="card" id="faults">
+      <h2>Fault Timeline <small>Recorded Sensor-Fault Events</small></h2>
       <div class="table-wrap">
         <table id="faultTable">
           <thead>
@@ -209,21 +227,21 @@
       </div>
     </section>
 
-    <section class="card">
-      <h2>Control configuration <small>thresholds chosen for this build</small></h2>
+    <section class="card" id="config">
+      <h2>Control Configuration <small>Thresholds chosen for this build</small></h2>
       <div class="cfg-grid" id="cfgGrid"></div>
       <p class="hint">
-        Anti-oscillation: median filtering → deadband → N consecutive agreeing samples →
-        clamped step → settle delay before the next decision.
+        Anti-oscillation: MedianFiltering → deadband → N Consecutive Agreeing Samples →
+      Clamped Step →Settle Delay Defore the Next Decision.
       </p>
     </section>
 
     <footer>
-      Embedded Systems Practical Challenge · Task 14 · Automatic Solar Tracking System
+      Embedded Systems Practical Challenge · Automatic Solar Tracking System
     </footer>
   </main>
 
-  <div class="toast" id="toast"></div>
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
   <script src="app.js"></script>
 </body>
 </html>
