@@ -1,4 +1,4 @@
-# Solar Tracker Demo (Task 14)
+# Solar Tracker Monitoring system
 
 ## Overview
 
