@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Automatic Solar Tracking System</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <div class="logo">☀</div>
+      <div>
+        <h1>Automatic Solar Tracking System</h1>
+        <p> Live Dashboard</p>
+      </div>
+    </div>
+    <div class="pills">
+      <span class="pill" id="pillConn">Connecting…</span>
+      <span class="pill pill-live hidden" id="pillLive">● Live</span>
+      <span class="pill" id="pillMode">—</span>
+      <span class="pill" id="pillState">—</span>
+      <span class="pill pill-danger hidden" id="pillFault">—</span>
+      <span class="pill pill-ghost" id="pillSeen">—</span>
+    </div>
+  </header>
+
+  <main>
+    <!--  live tiles  -->
+    <section class="tiles" id="tiles">
+      <article class="tile">
+        <span class="tile-label">LDR Left</span>
+        <strong class="tile-value" id="vLeft">—</strong>
+        <span class="tile-sub" id="sLeft">ADC Counts</span>
+        <div class="bar"><i id="bLeft"></i></div>
+      </article>
+      <article class="tile">
+        <span class="tile-label">LDR Right</span>
+        <strong class="tile-value" id="vRight">—</strong>
+        <span class="tile-sub" id="sRight">ADC Counts</span>
+        <div class="bar"><i id="bRight"></i></div>
+      </article>
+      <article class="tile">
+        <span class="tile-label">Light Difference</span>
+        <strong class="tile-value" id="vDiff">—</strong>
+        <span class="tile-sub" id="sDiff">Right − Left</span>
+        <div class="balance"><i id="bBalance"></i><em></em></div>
+      </article>
+      <article class="tile">
+        <span class="tile-label">Panel Angle</span>
+        <strong class="tile-value" id="vAngle">—</strong>
+        <span class="tile-sub">Servo Position (°)</span>
+        <div class="bar"><i id="bAngle"></i></div>
+      </article>
+      <article class="tile">
+        <span class="tile-label">Tracking State</span>
+        <strong class="tile-value tile-value-sm" id="vState">—</strong>
+        <span class="tile-sub" id="sState">Controller</span>
+      </article>
+      <article class="tile">
+        <span class="tile-label">Control Mode</span>
+        <strong class="tile-value tile-value-sm" id="vMode">—</strong>
+        <span class="tile-sub" id="sMode">Automatic / Manual</span>
+      </article>
+    </section>
+
+    <!-- visual + controls  -->
+    <div class="grid-2">
+      <section class="card">
+        <h2>Panel view <small id="alignNote">Live light balance from the two LDR sensors</small></h2>
+        <figure class="panel-photo">
+          <img id="panelImage" src="assets/solar-panels.jpg"
+               alt="Photograph of a ground-mounted solar panel array in a grassy field"
+               loading="lazy" />
+          <div class="photo-overlay">
+            <span class="photo-badge">LIVE PANEL ANGLE <strong id="svgAngle">—</strong></span>
+            <span class="photo-badge" id="svgState">Waiting for telemetry</span>
+          </div>
+        </figure>
+        <p class="image-credit">
+          Reference photo by <a href="https://commons.wikimedia.org/wiki/File:Ground_mounted_solar_panels.gk.jpg"
+             target="_blank" rel="noopener noreferrer">Grendelkhan</a> ·
+          <a href="https://creativecommons.org/licenses/by-sa/4.0/" target="_blank"
+             rel="noopener noreferrer">CC BY-SA 4.0</a>
+        </p>
+        <div class="legend">
+          <span><i class="dot dot-left"></i> Left LDR</span>
+          <span><i class="dot dot-right"></i> Right LDR</span>
+          <span><i class="dot dot-panel"></i> Photo tilt follows the reported servo angle</span>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>Remote control <small>Commands are validated, stored and answered with a reason</small></h2>
+
+        <div class="control-block">
+          <label class="control-label" for="apiKeyInput">API access key</label>
+          <div class="row">
+            <input id="apiKeyInput" type="password" autocomplete="current-password"
+                   placeholder="Enter SOLAR_API_KEY" />
+            <button class="btn btn-ghost" id="btnSaveKey">Connect</button>
+          </div>
+          <p class="hint" id="keyHint">Enter the shared API key from your .env file. It is kept for this browser session only.</p>
+        </div>
+
+        <div class="control-block">
+          <label class="control-label">Control mode</label>
+          <div class="segmented" id="modeSwitch">
+            <button data-mode="AUTO" class="btn">AUTO</button>
+            <button data-mode="MANUAL" class="btn">MANUAL</button>
+          </div>
+          <p class="hint" id="modeHint">AUTO Lets the Controller follow the stronger Light source.</p>
+        </div>
+
+        <div class="control-block">
+          <label class="control-label" for="angleSlider">
+            Manual panel position <output id="sliderOut">90°</output>
+          </label>
+          <input type="range" id="angleSlider" min="10" max="170" step="1" value="90" />
+          <div class="row">
+            <button class="btn btn-primary" id="btnMove">Move Panel</button>
+            <button class="btn" id="btnPark">Park at 90°</button>
+            <button class="btn btn-ghost" id="btnResync">Refresh State</button>
+          </div>
+          <p class="hint" id="moveHint">Direct moves are only accepted while the device is in MANUAL mode.</p>
+        </div>
+
+        <div class="control-block stats">
+          <div><span>Samples Stored</span><strong id="stSamples">0</strong></div>
+          <div><span>Orientation Events</span><strong id="stOrient">0</strong></div>
+          <div><span>Commands Sent</span><strong id="stCmds">0</strong></div>
+          <div><span>Commands Rejected</span><strong id="stRejected">0</strong></div>
+          <div><span>Degrees Moved</span><strong id="stDegrees">0°</strong></div>
+          <div><span>Time in AUTO</span><strong id="stAutoTime">0s</strong></div>
+        </div>
+        <div class="row">
+          <button class="btn btn-ghost" id="btnNotifications">Enable Notifications</button>
+        </div>
+      </section>
+    </div>
+
+    <!-- ============ charts ============ -->
+    <div class="grid-2">
+      <section class="card">
+        <h2>Light Measurements <small>Both LDR readings over time</small></h2>
+        <canvas id="lightChart" height="230"></canvas>
+      </section>
+      <section class="card">
+        <h2>Orientation History <small>Servo angle over time</small></h2>
+        <canvas id="angleChart" height="230"></canvas>
+      </section>
+    </div>
+
+    <!-- ============ tables ============ -->
+    <section class="card">
+      <div class="section-heading">
+        <h2>Command history <small>Track requests sent to the device and their results</small></h2>
+        <label class="filter-control" for="cmdFilter">
+          Status
+          <select id="cmdFilter">
+            <option value="all">All commands</option>
+            <option value="PENDING">Pending</option>
+            <option value="EXECUTED">Executed</option>
+            <option value="REJECTED">Rejected</option>
+            <option value="FAILED">Failed</option>
+            <option value="EXPIRED">Expired</option>
+          </select>
+        </label>
+      </div>
+      <div class="row export-actions">
+        <button class="btn btn-ghost" id="btnExportLightCSV">Export light CSV</button>
+        <button class="btn btn-ghost" id="btnExportOrientCSV">Export orientation CSV</button>
+        <button class="btn btn-ghost" id="btnExportJSON">Export JSON</button>
+      </div>
+      <div class="table-wrap">
+        <table id="cmdTable">
+          <thead>
+            <tr>
+              <th>#</th><th>Time</th><th>Type</th><th>Payload</th>
+              <th>Source</th><th>Status</th><th>Reason</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Orientation history log <small>every angle / mode / tracking-state transition</small></h2>
+      <div class="table-wrap">
+        <table id="orientTable">
+          <thead>
+            <tr><th>Time</th><th>Angle</th><th>Mode</th><th>State</th><th>Reason</th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Fault timeline <small>Recorded sensor-fault events</small></h2>
+      <div class="table-wrap">
+        <table id="faultTable">
+          <thead>
+            <tr><th>Time</th><th>Angle</th><th>Mode</th><th>Fault</th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Control configuration <small>thresholds chosen for this build</small></h2>
+      <div class="cfg-grid" id="cfgGrid"></div>
+      <p class="hint">
+        Anti-oscillation: median filtering → deadband → N consecutive agreeing samples →
+        clamped step → settle delay before the next decision.
+      </p>
+    </section>
+
+    <footer>
+      Embedded Systems Practical Challenge · Task 14 · Automatic Solar Tracking System
+    </footer>
+  </main>
+
+  <div class="toast" id="toast"></div>
+  <script src="app.js"></script>
+</body>
+</html>
