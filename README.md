@@ -171,6 +171,24 @@ Rate limits: telemetry endpoints are limited to 300 requests per client IP per m
 
 ---
 
+## Dashboard Screenshots
+
+These screenshots show the live dashboard in normal operation, including the telemetry cards, panel view, and command history.
+
+> Place the image files in `docs/images/` with these names so the links render correctly:
+>
+> - `docs/images/dashboard-live.png`
+> - `docs/images/dashboard-charts.png`
+> - `docs/images/dashboard-commands.png`
+
+![Live solar panel dashboard](docs/images/dashboard-live.png)
+
+![Light measurements and orientation history](docs/images/dashboard-charts.png)
+
+![Command history and audit trail](docs/images/dashboard-commands.png)
+
+---
+
 ## Control Algorithm — How It Works
 
 The control pipeline is implemented in `shared/control.py`. Key stages:
